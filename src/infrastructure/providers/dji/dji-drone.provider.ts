@@ -8,6 +8,7 @@ import {
   FlightSegment,
   FlightCoordinate,
 } from 'src/domain/interfaces/flight-log.interface';
+import { TrackingData } from 'src/domain/interfaces/tracking-data.interface';
 
 @Injectable()
 export class DJIDroneProvider implements DroneProvider {
@@ -93,5 +94,77 @@ export class DJIDroneProvider implements DroneProvider {
 
   private feetToMeters(feet: number): number {
     return feet * 0.3048;
+  }
+
+  async parseTrackingData(trackingPath: string): Promise<TrackingData> {
+    try {
+      const fileContent = await fs.readFile(trackingPath, 'utf-8');
+      const data = JSON.parse(fileContent);
+
+      this.validateTrackingData(data);
+
+      return data;
+    } catch (error) {
+      this.logger.error('Failed to parse tracking data', error);
+      throw new Error(`Failed to parse tracking data: ${error.message}`);
+    }
+  }
+
+  mapFrameToTime(
+    frameIndex: number,
+    fps: number,
+    segmentStartTime: number,
+  ): number {
+    // 프레임 인덱스를 밀리초 단위 시간으로 변환
+    const frameTime = (frameIndex / fps) * 1000;
+    return segmentStartTime + frameTime;
+  }
+
+  private validateTrackingData(data: any): asserts data is TrackingData {
+    if (
+      !data.model?.name ||
+      typeof data.model.confidence_threshold !== 'number' ||
+      typeof data.model.nms !== 'boolean'
+    ) {
+      throw new Error('Invalid model information');
+    }
+
+    if (!data.tracker?.name) {
+      throw new Error('Invalid tracker information');
+    }
+
+    if (
+      !data.video?.width ||
+      !data.video?.height ||
+      !data.video?.fps ||
+      !data.video?.total_frames
+    ) {
+      throw new Error('Invalid video metadata');
+    }
+
+    if (!Array.isArray(data.tracking_results)) {
+      throw new Error('Invalid tracking results');
+    }
+
+    // 각 트래킹 결과의 형식 검증
+    data.tracking_results.forEach((result, index) => {
+      if (typeof result.i !== 'number' || !Array.isArray(result.res)) {
+        throw new Error(`Invalid tracking result at index ${index}`);
+      }
+
+      result.res.forEach((detection, detIndex) => {
+        if (
+          !Array.isArray(detection.bbox) ||
+          detection.bbox.length !== 4 ||
+          typeof detection.conf !== 'number' ||
+          typeof detection.tid !== 'number' ||
+          typeof detection.cid !== 'number'
+        ) {
+          throw new Error(
+            `Invalid detection at frame ${result.i}, detection ${detIndex}`,
+          );
+        }
+      });
+    });
   }
 }
