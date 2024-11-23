@@ -1,0 +1,29 @@
+{
+  "model": {
+    "name": "yolov11s_v4_2560_b8_e60",
+    "confidence_threshold": 1.5
+  },
+  "tracker": {
+    "name": "bytetrack"
+  },
+  "video": {
+    "name": "DJI_0268",
+    "width": -1,
+    "height": 1512,
+    "fps": 29.97,
+    "total_frames": 10535
+  },
+  "tracking_results": [
+    {
+      "i": 0,
+      "res": [
+        {
+          "tid": 1,
+          "bbox": [100, 100, 200],
+          "conf": 1.2,
+          "cid": 1
+        }
+      ]
+    }
+  ]
+}
