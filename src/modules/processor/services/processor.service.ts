@@ -2,14 +2,15 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { FlightLogProcessor } from '../../flight/services/flight-log.processor';
 import { VideoTrackingProcessor } from '../../video/services/video-tracking.processor';
+import { GeoreferencingProcessor } from '../../georeferencing/services/georeferencing.processor';
 import {
   ProcessingResult,
-  ProcessedVideoSegment,
+  ProcessedSegment,
   ProcessedFrame,
+  CameraParams,
 } from '../types';
-import { FlightMetadata, LogEntry, VideoSegment } from '../../flight/types';
-import { VideoMetadata, TrackingFrame } from '../../video/types';
-import { GeoreferencingProcessor } from '@/modules/georeferencing/services/georeferencing.processor';
+import { FlightMetadata, LogEntry } from '@/modules/flight/types';
+import { TrackingFrame } from '@/modules/video/types';
 
 @Injectable()
 export class ProcessorService {
@@ -24,126 +25,123 @@ export class ProcessorService {
   async processFlightData(
     metadata: FlightMetadata,
     logPath: string,
-    videoPaths: string[],
     trackingPaths: string[],
-    cameraParams: {
-      horizontalFov: number;
-      verticalFov: number;
-    },
+    cameraParams: CameraParams,
   ): Promise<ProcessingResult> {
-    this.logger.debug(`🤔 Processing flight data: ${metadata.name}`);
+    try {
+      this.logger.log(`Processing flight data: ${metadata.name}`);
 
-    // 1. Process flight log
-    const { logEntries, videoSegments } =
-      await this.flightLogProcessor.processLogFile(logPath);
-    this.logger.debug(
-      `Found ${videoSegments.length} video segments in flight log`,
-    );
+      // 1. 비행 로그 처리
+      const { logEntries, videoSegments } =
+        await this.flightLogProcessor.processLogFile(logPath);
 
-    // 2. Process each video and its tracking data
-    const processedSegments = await this.processVideoSegments(
-      videoSegments,
-      videoPaths,
-      trackingPaths,
-      cameraParams,
-    );
-    this.logger.debug(`Processed ${processedSegments.length} video segments`);
-
-    return {
-      metadata,
-      segments: processedSegments,
-    };
-  }
-
-  private async processVideoSegments(
-    segments: VideoSegment[],
-    videoPaths: string[],
-    trackingPaths: string[],
-    cameraParams: {
-      horizontalFov: number;
-      verticalFov: number;
-    },
-  ): Promise<ProcessedVideoSegment[]> {
-    const processedSegments: ProcessedVideoSegment[] = [];
-
-    for (let i = 0; i < segments.length; i++) {
-      const segment = segments[i];
-      const videoPath = videoPaths[i];
-      const trackingPath = trackingPaths[i];
-
-      if (!videoPath || !trackingPath) {
-        this.logger.warn(`Missing video or tracking file for segment ${i}`);
-        continue;
+      if (videoSegments.length === 0) {
+        throw new Error('No video segments found in flight log');
       }
 
-      // Process tracking data
-      const { metadata: videoMeta, frames } =
-        await this.videoTrackingProcessor.processTrackingFile(trackingPath);
+      if (videoSegments.length !== trackingPaths.length) {
+        throw new Error(
+          `Video segment count (${videoSegments.length}) does not match tracking file count (${trackingPaths.length})`,
+        );
+      }
 
-      // Match frames with log entries
-      const processedSegment = await this.matchFramesWithLog(
-        segment,
-        videoMeta,
-        frames,
-        cameraParams,
+      // 2. 각 세그먼트와 트래킹 파일을 순서대로 처리
+      const processedSegments: ProcessedSegment[] = await Promise.all(
+        videoSegments.map(async (segment, index) => {
+          // 순서대로 트래킹 파일 할당
+          const trackingPath = trackingPaths[index];
+
+          // 트래킹 데이터 처리
+          const { metadata: videoMeta, frames: trackingFrames } =
+            await this.videoTrackingProcessor.processTrackingFile(trackingPath);
+
+          // 비행 로그, 트래킹 데이터, 비디오 메타데이터, 카메라 파라미터를 이용하여 프레임 처리
+          const processedFrames = await this.processFrames(
+            trackingFrames,
+            segment.logEntries,
+            segment.startTimeMs,
+            videoMeta.fps,
+            cameraParams,
+            videoMeta.width,
+            videoMeta.height,
+          );
+
+          return {
+            segmentStartTime: segment.logEntries[0].timestamp,
+            segmentEndTime:
+              segment.logEntries[segment.logEntries.length - 1].timestamp,
+            startTimeMs: segment.startTimeMs,
+            endTimeMs: segment.endTimeMs,
+            video: videoMeta,
+            frames: processedFrames,
+          };
+        }),
       );
 
-      processedSegments.push(processedSegment);
-    }
-
-    return processedSegments;
-  }
-
-  private async matchFramesWithLog(
-    segment: VideoSegment,
-    videoMeta: VideoMetadata,
-    trackingFrames: TrackingFrame[],
-    cameraParams: {
-      horizontalFov: number;
-      verticalFov: number;
-    },
-  ): Promise<ProcessedVideoSegment> {
-    const frameInterval = 1000 / videoMeta.fps;
-
-    const frames: ProcessedFrame[] = trackingFrames.map((frame) => {
-      const frameTimeMs = Math.floor(frame.frameIndex * frameInterval);
-
-      // 드론 위치 보간
-      const dronePosition = this.georeferencingProcessor.interpolatePosition(
-        frameTimeMs,
-        segment.logEntries,
-        segment.startTimeMs,
+      this.logger.log(
+        `Successfully processed ${processedSegments.length} video segments`,
       );
-
-      // 각 객체의 지리 좌표 계산
-      const geoReferencedObjects = frame.objects.map((obj) => ({
-        trackId: obj.trackId,
-        classId: obj.classId,
-        confidence: obj.confidence,
-        position: this.georeferencingProcessor.calculateObjectGeoPosition(
-          obj.bbox,
-          dronePosition,
-          {
-            horizontalFov: cameraParams.horizontalFov,
-            verticalFov: cameraParams.verticalFov,
-            height: dronePosition.altitude,
-            heading: dronePosition.heading,
-          },
-        ),
-      }));
 
       return {
-        frameIndex: frame.frameIndex,
-        timestamp: dronePosition.timestamp,
-        dronePosition,
-        objects: geoReferencedObjects,
+        metadata,
+        segments: processedSegments,
+        cameraParams,
       };
-    });
+    } catch (error) {
+      this.logger.error('Failed to process flight data', error);
+      throw new Error(`Flight data processing failed: ${error.message}`);
+    }
+  }
 
-    return {
-      segment,
-      video: videoMeta,
-      frames,
-    };
+  private async processFrames(
+    trackingFrames: TrackingFrame[],
+    logEntries: LogEntry[],
+    segmentStartTimeMs: number,
+    fps: number,
+    cameraParams: CameraParams,
+    imageWidth: number,
+    imageHeight: number,
+  ): Promise<ProcessedFrame[]> {
+    return Promise.all(
+      trackingFrames.map(async (frame) => {
+        // 프레임 시간 계산
+        const frameTimeMs = Math.floor((frame.frameIndex / fps) * 1000);
+        // 비행 시작으로부터의 경과 시간
+        const absoluteTimeMs = segmentStartTimeMs + frameTimeMs;
+
+        // 해당 시점의 드론 상태 보간
+        const droneState = this.georeferencingProcessor.interpolateDroneState(
+          absoluteTimeMs,
+          logEntries,
+        );
+
+        // 각 객체의 지리 좌표 계산
+        const processedObjects = frame.objects.map((obj) => {
+          const position =
+            this.georeferencingProcessor.calculateObjectGeoPosition(
+              obj.bbox,
+              droneState,
+              cameraParams,
+              imageWidth,
+              imageHeight,
+            );
+
+          return {
+            trackId: obj.trackId,
+            classId: obj.classId,
+            confidence: obj.confidence,
+            position,
+            bbox: obj.bbox, // bbox 정보를 추가하여 디버깅에 활용
+          };
+        });
+
+        return {
+          frameIndex: frame.frameIndex,
+          timestamp: droneState.timestamp,
+          droneState,
+          objects: processedObjects,
+        };
+      }),
+    );
   }
 }

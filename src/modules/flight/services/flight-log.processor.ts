@@ -34,6 +34,7 @@ export class FlightLogProcessor {
         .on('data', (row) => {
           const timestamp = new Date(row['datetime(utc)']);
           const timeMs = parseInt(row['time(millisecond)']);
+          const altitudeFeet = parseFloat(row['ascent(feet)']);
 
           // 첫 타임스탬프를 기준으로 상대 시간 계산
           if (firstTimestamp === null) {
@@ -45,8 +46,8 @@ export class FlightLogProcessor {
             timestamp: timestamp,
             latitude: parseFloat(row['latitude']),
             longitude: parseFloat(row['longitude']),
-            altitude: parseFloat(row['ascent(feet)']),
-            compassHeading: parseFloat(row['compass_heading(degrees)']),
+            altitude: altitudeFeet * 0.3048, // Convert feet to meters
+            heading: parseFloat(row['compass_heading(degrees)']),
             isVideo: Boolean(parseInt(row['isVideo'])),
           });
         })

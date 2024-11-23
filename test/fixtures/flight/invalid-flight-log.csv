@@ -1,4 +1,0 @@
-time(millisecond),datetime(utc),latitude,longitude,ascent(feet),compass_heading(degrees),isVideo
--1000,2024-01-01T12:00:00Z,37.5,400.5,100,-90,2
-2000,invalid-date,91.6,127.6,110,92,1
-3000,2024-01-01T12:00:02Z,37.7,127.7,120,400,1

@@ -1,126 +1,259 @@
 // src/modules/georeferencing/services/georeferencing.processor.ts
 import { Injectable, Logger } from '@nestjs/common';
-import { GeoPoint, LogEntry } from '../../flight/types';
 import {
-  GeoReferencedBbox,
-  GeoReferencedPoint,
-  InterpolatedPosition,
+  DroneState,
+  GeoPoint,
+  GeoReferencedObject,
+  ObjectDimensions,
 } from '../types';
 import { BoundingBox } from '@/modules/video/types';
+import { CameraParams } from '@/modules/processor/types';
+import { LogEntry } from '@/modules/flight/types';
 
 @Injectable()
 export class GeoreferencingProcessor {
   private readonly logger = new Logger(GeoreferencingProcessor.name);
-  private readonly EARTH_RADIUS_METERS = 6371000;
+  private readonly EARTH_RADIUS = 6371000; // meters
 
   /**
-   * 비디오 프레임 시간에 맞는 위치 정보를 보간하여 계산
+   * 드론 상태 보간 계산
    */
-  interpolatePosition(
-    frameTimeMs: number,
+  interpolateDroneState(
+    targetTimeMs: number,
     logEntries: LogEntry[],
-    segmentStartTimeMs: number,
-  ): InterpolatedPosition {
-    const absoluteTimeMs = segmentStartTimeMs + frameTimeMs;
+  ): DroneState {
+    // 로그 엔트리가 시간 순서대로 정렬되어 있다고 가정합니다.
 
-    // 주어진 시간에 가장 가까운 로그 엔트리 두 개 찾기
-    const { before, after } = this.findSurroundingLogEntries(
-      logEntries,
-      absoluteTimeMs,
-    );
-
-    // 정확히 일치하는 시간의 로그가 있는 경우
-    if (before.timeMs === absoluteTimeMs) {
-      return {
-        ...this.convertToGeoPoint(before),
-        interpolationWeight: 1,
-      };
+    // Edge cases 처리
+    if (targetTimeMs <= logEntries[0].timeMs) {
+      this.logger.warn(
+        `Target time ${targetTimeMs}ms is before first log entry, using first log entry state`,
+      );
+      return this.convertToDroneState(logEntries[0]);
+    }
+    if (targetTimeMs >= logEntries[logEntries.length - 1].timeMs) {
+      this.logger.warn(
+        `Target time ${targetTimeMs}ms is after last log entry, using last log entry state`,
+      );
+      return this.convertToDroneState(logEntries[logEntries.length - 1]);
     }
 
-    // 두 시점 사이에서 보간
-    const weight = this.calculateInterpolationWeight(
-      absoluteTimeMs,
-      before.timeMs,
-      after.timeMs,
-    );
+    // 이진 검색으로 적절한 인덱스 찾기
+    let left = 0;
+    let right = logEntries.length - 1;
+
+    while (left <= right) {
+      const mid = Math.floor((left + right) / 2);
+      const midTime = logEntries[mid].timeMs;
+
+      if (midTime === targetTimeMs) {
+        return this.convertToDroneState(logEntries[mid]);
+      } else if (midTime < targetTimeMs) {
+        left = mid + 1;
+      } else {
+        right = mid - 1;
+      }
+    }
+
+    // 보간을 위한 beforeState와 afterState 선택
+    const beforeIndex = Math.max(0, right);
+    const afterIndex = Math.min(logEntries.length - 1, left);
+
+    const beforeState = this.convertToDroneState(logEntries[beforeIndex]);
+    const afterState = this.convertToDroneState(logEntries[afterIndex]);
+
+    // 시간 범위 검증
+    if (targetTimeMs < beforeState.timeMs || targetTimeMs > afterState.timeMs) {
+      this.logger.error(`interpolateDroneState에서 시간 범위 오류`, {
+        targetTimeMs,
+        'beforeState.timeMs': beforeState.timeMs,
+        'afterState.timeMs': afterState.timeMs,
+      });
+      throw new Error(
+        'Target time is outside the state range after binary search',
+      );
+    }
+
+    // 가중치 계산 (0-1)
+    const weight =
+      (targetTimeMs - beforeState.timeMs) /
+      (afterState.timeMs - beforeState.timeMs);
 
     return {
-      latitude: this.interpolateValue(before.latitude, after.latitude, weight),
-      longitude: this.interpolateValue(
-        before.longitude,
-        after.longitude,
+      latitude: this.interpolateLinear(
+        beforeState.latitude,
+        afterState.latitude,
         weight,
       ),
-      altitude: this.interpolateValue(before.altitude, after.altitude, weight),
+      longitude: this.interpolateLinear(
+        beforeState.longitude,
+        afterState.longitude,
+        weight,
+      ),
+      altitude: this.interpolateLinear(
+        beforeState.altitude,
+        afterState.altitude,
+        weight,
+      ),
       heading: this.interpolateHeading(
-        before.compassHeading,
-        after.compassHeading,
+        beforeState.heading,
+        afterState.heading,
         weight,
       ),
       timestamp: new Date(
-        before.timestamp.getTime() +
-          (after.timestamp.getTime() - before.timestamp.getTime()) * weight,
+        beforeState.timestamp.getTime() +
+          (afterState.timestamp.getTime() - beforeState.timestamp.getTime()) *
+            weight,
       ),
-      timeMs: absoluteTimeMs,
-      interpolationWeight: weight,
+      timeMs: targetTimeMs,
     };
   }
 
   /**
-   * 프레임 시간을 기준으로 앞뒤 로그 엔트리 찾기
+   * 객체의 지리 좌표 계산 (탑뷰 가정)
    */
-  private findSurroundingLogEntries(
-    logEntries: LogEntry[],
-    targetTimeMs: number,
-  ): { before: LogEntry; after: LogEntry } {
-    let beforeIndex = 0;
-    let afterIndex = 1;
+  calculateObjectGeoPosition(
+    bbox: BoundingBox,
+    droneState: DroneState,
+    cameraParams: CameraParams,
+    imageWidth: number,
+    imageHeight: number,
+  ): GeoReferencedObject {
+    // bbox를 정규화된 값으로 변환 (0~1 사이)
+    const normalizedBbox = this.normalizeBoundingBox(bbox, imageWidth, imageHeight);
 
-    // 이진 검색으로 적절한 구간 찾기
-    while (afterIndex < logEntries.length) {
-      if (
-        logEntries[beforeIndex].timeMs <= targetTimeMs &&
-        logEntries[afterIndex].timeMs >= targetTimeMs
-      ) {
-        break;
-      }
-      beforeIndex++;
-      afterIndex++;
-    }
+    // 1. 이미지 상의 상대좌표를 실제 거리로 변환
+    const {
+      xOffset,
+      yOffset,
+      dimensions,
+      pixelToWorldRatio,
+    } = this.calculateOffsetsAndDimensions(
+      normalizedBbox,
+      droneState.altitude,
+      cameraParams.horizontalFov,
+      cameraParams.verticalFov,
+    );
 
-    // 범위를 벗어난 경우 처리
-    if (afterIndex >= logEntries.length) {
-      beforeIndex = logEntries.length - 2;
-      afterIndex = logEntries.length - 1;
-    }
+    // 2. 드론의 헤딩을 고려하여 x, y 오프셋을 회전 변환
+    const { rotatedX, rotatedY } = this.rotateOffsets(
+      xOffset,
+      yOffset,
+      droneState.heading,
+    );
+
+    // 3. 드론 위치에서 오프셋을 적용하여 객체 위치 계산
+    const center = this.calculateDestinationPoint(
+      droneState,
+      rotatedX,
+      rotatedY,
+    );
 
     return {
-      before: logEntries[beforeIndex],
-      after: logEntries[afterIndex],
+      center: {
+        ...center,
+        altitude: 0, // 지상 고도
+      },
+      dimensions,
+      pixelToWorldRatio,
     };
   }
 
-  /**
-   * 보간 가중치 계산 (0-1 사이 값)
-   */
-  private calculateInterpolationWeight(
-    targetTime: number,
-    beforeTime: number,
-    afterTime: number,
-  ): number {
-    return (targetTime - beforeTime) / (afterTime - beforeTime);
+  private normalizeBoundingBox(
+    bbox: BoundingBox,
+    imageWidth: number,
+    imageHeight: number,
+  ): BoundingBox {
+    return {
+      x: bbox.x / imageWidth,
+      y: bbox.y / imageHeight,
+      width: bbox.width / imageWidth,
+      height: bbox.height / imageHeight,
+    };
   }
 
-  /**
-   * 선형 보간
-   */
-  private interpolateValue(start: number, end: number, weight: number): number {
+  private calculateOffsetsAndDimensions(
+    bbox: BoundingBox,
+    altitude: number,
+    horizontalFov: number,
+    verticalFov: number,
+  ): {
+    xOffset: number; // meters
+    yOffset: number; // meters
+    dimensions: ObjectDimensions;
+    pixelToWorldRatio: number; // meters per pixel
+  } {
+    // 화각의 radian 변환
+    const hFovRad = (horizontalFov * Math.PI) / 180;
+    const vFovRad = (verticalFov * Math.PI) / 180;
+
+    // 이미지 상의 상대 위치 (-0.5 ~ 0.5)
+    const xRelative = bbox.x - 0.5;
+    const yRelative = 0.5 - bbox.y; // y축 방향 반전
+
+    // 지상 평면에서의 최대 x, y 거리
+    const maxX = altitude * Math.tan(hFovRad / 2);
+    const maxY = altitude * Math.tan(vFovRad / 2);
+
+    // 실제 x, y 오프셋 계산
+    const xOffset = xRelative * 2 * maxX;
+    const yOffset = yRelative * 2 * maxY;
+
+    // 객체의 실제 크기 계산
+    const dimensions = {
+      width: bbox.width * 2 * maxX,
+      height: bbox.height * 2 * maxY,
+    };
+
+    // 픽셀 당 실제 거리 (가로 방향 기준)
+    const pixelToWorldRatio = (2 * maxX) / 1; // normalized width가 1일 때의 실제 거리
+
+    return { xOffset, yOffset, dimensions, pixelToWorldRatio };
+  }
+
+  private rotateOffsets(
+    xOffset: number,
+    yOffset: number,
+    heading: number,
+  ): { rotatedX: number; rotatedY: number } {
+    const headingRad = ((heading - 90) * Math.PI) / 180; // 북쪽이 0도 기준이 되도록 보정
+
+    const cosH = Math.cos(headingRad);
+    const sinH = Math.sin(headingRad);
+
+    const rotatedX = xOffset * cosH - yOffset * sinH;
+    const rotatedY = xOffset * sinH + yOffset * cosH;
+
+    return { rotatedX, rotatedY };
+  }
+
+  private calculateDestinationPoint(
+    start: GeoPoint,
+    xOffset: number,
+    yOffset: number,
+  ): GeoPoint {
+    // 위도 1미터당 거리 (근사치)
+    const deltaLat = (yOffset / this.EARTH_RADIUS) * (180 / Math.PI);
+    const deltaLon =
+      (xOffset /
+        (this.EARTH_RADIUS * Math.cos((start.latitude * Math.PI) / 180))) *
+      (180 / Math.PI);
+
+    return {
+      latitude: start.latitude + deltaLat,
+      longitude: start.longitude + deltaLon,
+      altitude: start.altitude,
+    };
+  }
+
+  private interpolateLinear(
+    start: number,
+    end: number,
+    weight: number,
+  ): number {
     return start + (end - start) * weight;
   }
 
-  /**
-   * 방향(heading) 보간 - 360도 WrappAround 고려
-   */
   private interpolateHeading(
     start: number,
     end: number,
@@ -129,192 +262,26 @@ export class GeoreferencingProcessor {
     let diff = end - start;
 
     // 360도 교차점 처리
-    if (diff > 180) {
-      diff -= 360;
-    } else if (diff < -180) {
-      diff += 360;
-    }
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
 
     let result = start + diff * weight;
 
-    // 결과값을 0-360 범위로 정규화
-    if (result >= 360) {
-      result -= 360;
-    } else if (result < 0) {
-      result += 360;
-    }
+    // 결과값 정규화
+    if (result >= 360) result -= 360;
+    if (result < 0) result += 360;
 
     return result;
   }
 
-  /**
-   * 로그 엔트리를 GeoPoint로 변환
-   */
-  private convertToGeoPoint(entry: LogEntry): GeoReferencedPoint {
+  private convertToDroneState(entry: LogEntry): DroneState {
     return {
       latitude: entry.latitude,
       longitude: entry.longitude,
       altitude: entry.altitude,
-      heading: entry.compassHeading,
+      heading: entry.heading,
       timestamp: entry.timestamp,
       timeMs: entry.timeMs,
-    };
-  }
-
-  /**
-   * 객체의 bbox를 지리 좌표로 변환
-   */
-  calculateObjectGeoPosition(
-    bbox: BoundingBox,
-    dronePosition: GeoReferencedPoint,
-    cameraParams: {
-      horizontalFov: number; // 수평 화각 (도)
-      verticalFov: number; // 수직 화각 (도)
-      height: number; // 비행 고도 (미터)
-      heading: number; // 드론 heading (도)
-    },
-  ): GeoReferencedBbox {
-    // 1. 이미지 상의 좌표를 실제 거리로 변환
-    const distances = this.calculateDistancesFromDrone(
-      bbox,
-      cameraParams.horizontalFov,
-      cameraParams.verticalFov,
-      cameraParams.height,
-    );
-
-    // 2. 드론 heading을 고려하여 실제 방향 계산
-    const bearings = this.calculateBearings(distances, cameraParams.heading);
-
-    // 3. 각 점의 지리 좌표 계산
-    const corners = {
-      topLeft: this.calculateDestinationPoint(
-        dronePosition,
-        bearings.topLeft,
-        distances.topLeft,
-      ),
-      topRight: this.calculateDestinationPoint(
-        dronePosition,
-        bearings.topRight,
-        distances.topRight,
-      ),
-      bottomLeft: this.calculateDestinationPoint(
-        dronePosition,
-        bearings.bottomLeft,
-        distances.bottomLeft,
-      ),
-      bottomRight: this.calculateDestinationPoint(
-        dronePosition,
-        bearings.bottomRight,
-        distances.bottomRight,
-      ),
-    };
-
-    // 4. 중심점 계산
-    const center = this.calculateDestinationPoint(
-      dronePosition,
-      bearings.center,
-      distances.center,
-    );
-
-    return {
-      center,
-      corners,
-      originalBbox: bbox,
-    };
-  }
-
-  /**
-   * 이미지 상의 좌표를 드론으로부터의 실제 거리로 변환
-   */
-  private calculateDistancesFromDrone(
-    bbox: BoundingBox,
-    horizontalFov: number,
-    verticalFov: number,
-    height: number,
-  ) {
-    // 화각을 라디안으로 변환
-    const hFovRad = (horizontalFov * Math.PI) / 180;
-    const vFovRad = (verticalFov * Math.PI) / 180;
-
-    // 이미지 중심으로부터의 각도 계산
-    const angleX = (bbox.x - 0.5) * hFovRad;
-    const angleY = (bbox.y - 0.5) * vFovRad;
-
-    // 실제 거리 계산 (탄젠트 사용)
-    const distanceX = height * Math.tan(angleX);
-    const distanceY = height * Math.tan(angleY);
-
-    // bbox의 각 모서리에 대한 거리 계산
-    const halfWidth = (bbox.width * hFovRad) / 2;
-    const halfHeight = (bbox.height * vFovRad) / 2;
-
-    return {
-      center: Math.sqrt(distanceX ** 2 + distanceY ** 2),
-      topLeft: Math.sqrt(
-        (distanceX - halfWidth) ** 2 + (distanceY - halfHeight) ** 2,
-      ),
-      topRight: Math.sqrt(
-        (distanceX + halfWidth) ** 2 + (distanceY - halfHeight) ** 2,
-      ),
-      bottomLeft: Math.sqrt(
-        (distanceX - halfWidth) ** 2 + (distanceY + halfHeight) ** 2,
-      ),
-      bottomRight: Math.sqrt(
-        (distanceX + halfWidth) ** 2 + (distanceY + halfHeight) ** 2,
-      ),
-    };
-  }
-
-  /**
-   * 드론 heading을 고려한 실제 방향 계산
-   */
-  private calculateBearings(
-    distances: Record<string, number>,
-    droneHeading: number,
-  ) {
-    const headingRad = (droneHeading * Math.PI) / 180;
-
-    return {
-      center: headingRad,
-      topLeft: headingRad - Math.atan2(distances.topLeft, distances.center),
-      topRight: headingRad + Math.atan2(distances.topRight, distances.center),
-      bottomLeft:
-        headingRad - Math.atan2(distances.bottomLeft, distances.center),
-      bottomRight:
-        headingRad + Math.atan2(distances.bottomRight, distances.center),
-    };
-  }
-
-  /**
-   * 시작점, 방향, 거리를 이용하여 도착점의 지리 좌표 계산
-   */
-  private calculateDestinationPoint(
-    start: GeoReferencedPoint,
-    bearing: number,
-    distance: number,
-  ): GeoPoint {
-    const startLatRad = (start.latitude * Math.PI) / 180;
-    const startLonRad = (start.longitude * Math.PI) / 180;
-
-    const angularDistance = distance / this.EARTH_RADIUS_METERS;
-
-    const destinationLatRad = Math.asin(
-      Math.sin(startLatRad) * Math.cos(angularDistance) +
-        Math.cos(startLatRad) * Math.sin(angularDistance) * Math.cos(bearing),
-    );
-
-    const destinationLonRad =
-      startLonRad +
-      Math.atan2(
-        Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(startLatRad),
-        Math.cos(angularDistance) -
-          Math.sin(startLatRad) * Math.sin(destinationLatRad),
-      );
-
-    return {
-      latitude: (destinationLatRad * 180) / Math.PI,
-      longitude: (destinationLonRad * 180) / Math.PI,
-      altitude: start.altitude,
     };
   }
 }

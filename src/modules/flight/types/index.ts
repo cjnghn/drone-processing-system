@@ -14,7 +14,7 @@ export interface GeoPoint {
 export interface LogEntry extends GeoPoint {
   timeMs: number; // milliseconds since start
   timestamp: Date; // absolute UTC time
-  compassHeading: number; // degrees
+  heading: number; // degrees
   isVideo: boolean;
 }
 

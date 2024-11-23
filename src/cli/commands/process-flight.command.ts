@@ -9,10 +9,12 @@ node dist/cli process-flight \
   --videos "../2024-11-19/DJI_0279.MP4,../2024-11-19/DJI_0280.MP4" \
   --trackings "../2024-11-19/bytetrack_yolov11s_v4_2560_b8_e60_DJI_0279.json,../2024-11-19/bytetrack_yolov11s_v4_2560_b8_e60_DJI_0280.json"
  */
+
+// src/cli/commands/process-flight.command.ts
 import { Command, CommandRunner, Option } from 'nest-commander';
 import { ProcessorService } from '@/modules/processor/services/processor.service';
 import { Logger } from '@nestjs/common';
-import { existsSync } from 'fs';
+import { existsSync, fstat, writeFileSync } from 'fs';
 import { resolve } from 'path';
 
 interface ProcessFlightOptions {
@@ -26,7 +28,7 @@ interface ProcessFlightOptions {
 
 @Command({
   name: 'process-flight',
-  description: '드론 비행 데이터를 처리합니다.',
+  description: '드론 비행 데이터를 처리하고 저장합니다',
 })
 export class ProcessFlightCommand extends CommandRunner {
   private readonly logger = new Logger(ProcessFlightCommand.name);
@@ -36,7 +38,7 @@ export class ProcessFlightCommand extends CommandRunner {
   }
 
   @Option({
-    flags: '--name [number]',
+    flags: '--name [name]',
     description: '비행 이름',
     required: true,
   })
@@ -45,11 +47,11 @@ export class ProcessFlightCommand extends CommandRunner {
   }
 
   @Option({
-    flags: '--date [date]',
+    flags: '--date <date>',
     description: '비행 날짜 (YYYY-MM-DD)',
     required: true,
   })
-  parseData(val: string): string {
+  parseDate(val: string): string {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(val)) {
       throw new Error('날짜 형식은 YYYY-MM-DD여야 합니다');
     }
@@ -83,13 +85,7 @@ export class ProcessFlightCommand extends CommandRunner {
     required: true,
   })
   parseVideos(val: string): string[] {
-    const paths = val.split(',').map((p) => resolve(p.trim()));
-    paths.forEach((path) => {
-      if (!existsSync(path)) {
-        throw new Error(`비디오 파일을 찾을 수 없습니다: ${path}`);
-      }
-    });
-    return paths;
+    return this.validatePaths(val, '비디오');
   }
 
   @Option({
@@ -98,10 +94,14 @@ export class ProcessFlightCommand extends CommandRunner {
     required: true,
   })
   parseTrackings(val: string): string[] {
+    return this.validatePaths(val, '트래킹');
+  }
+
+  private validatePaths(val: string, type: string): string[] {
     const paths = val.split(',').map((p) => resolve(p.trim()));
     paths.forEach((path) => {
       if (!existsSync(path)) {
-        throw new Error(`트래킹 파일을 찾을 수 없습니다: ${path}`);
+        throw new Error(`${type} 파일을 찾을 수 없습니다: ${path}`);
       }
     });
     return paths;
@@ -112,28 +112,30 @@ export class ProcessFlightCommand extends CommandRunner {
     options: ProcessFlightOptions,
   ): Promise<void> {
     try {
-      this.logger.log('비행 데이터 처리 시작...');
-      this.logger.debug('입력 옵션:', options);
+      this.logger.log(`비행 데이터 처리 시작: ${options.name}`);
 
-      const result = await this.processorService.processFlightData(
+      const processingResult = await this.processorService.processFlightData(
         {
           name: options.name,
           date: new Date(options.date),
           description: options.description,
         },
         options.log,
-        options.videos,
+        // options.videos, TOOO
         options.trackings,
         {
-          // 대각선 시야각 83
-          horizontalFov: 73.7,
-          verticalFov: 53.1,
+          horizontalFov: 84,
+          verticalFov: 62,
         },
       );
 
-      console.log('비행 데이터 처리 완료:', result.segments[0]);
+      this.logger.log('비행 데이터 처리 완료');
+      writeFileSync(
+        'result.json',
+        JSON.stringify(processingResult, null, 2),
+      );
     } catch (error) {
-      this.logger.error('비행 데이터 처리 중 오류 발생:', error);
+      this.logger.error('처리 실패:', error.message);
       process.exit(1);
     }
   }
